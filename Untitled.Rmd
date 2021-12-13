@@ -1,0 +1,282 @@
+---
+title: "Predicting heart disease"
+author: "none"
+date: "12/13/2021"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+doParallel::registerDoParallel(6)
+library(tidyverse)
+library(tidymodels)
+library(pander)
+theme_update(plot.title = element_text(hjust = .5))
+
+df <- read_csv("heart.csv")
+```
+
+## Class imbalance
+```{r}
+df %>% 
+    count(HeartDisease) %>% 
+    pander()
+```
+First of all this is a balance dataset. We will perform the explonatory data analysis now.
+
+```{r}
+skimr::skim(df) %>% 
+    select(-c(n_missing, character.min, character.max, character.empty)) %>% 
+    filter(skim_variable != "HeartDisease")
+```
+This dataset total contains 918 rows and 12 columns. Among those 12 columns 1 is outcome variable and 11 is predictor. 5 of those predictors are character and 6 of those predictors are numeric. The source of the data is {**Kaggle**}[https://www.kaggle.com/fedesoriano/heart-failure-prediction]
+
+## Train test split
+```{r}
+df_split <- 
+    df %>% 
+    initial_split(prop = .9 ,strata = "HeartDisease")
+
+df <- training(df_split)
+```
+
+## Boxplot for the categorical variables
+```{r}
+df %>% 
+    select(is.character, HeartDisease) %>% 
+    pivot_longer(-HeartDisease) %>% 
+    group_by(name, value) %>% 
+    summarise_all(mean) %>% 
+    ungroup() %>% 
+    mutate(value = tidytext::reorder_within(value,by = HeartDisease, within = name)) %>% 
+    ggplot(aes(value, HeartDisease)) +
+    geom_col(fill = "lightgreen", col = "darkgreen") +
+    tidytext::scale_x_reordered() +
+    facet_wrap(~name, scales = "free") +
+    labs(title = "Barplot for the categorical variables")
+```
+So we can see that for variable 
+
+    - ExerciseAngina level (N) has lower chance of heart disease.
+    - ChestPain Type level (ATA, NAP, TA) has lower chance of heart disease.
+    - SEX            level (F) has lower chance of heart disease.
+    - ST_Slope       Level (Up) has lower chance of heart disease.
+
+So those categorical variables could be good predictor for the heart disease.
+
+## Density plot for the numeric variables
+```{r}
+df %>% 
+    select(is.numeric) %>% 
+    pivot_longer(-HeartDisease) %>% 
+    mutate(HeartDisease = factor(HeartDisease, 0:1, c("NO", "Yes"))) %>% 
+    ggplot(aes(value, fill = HeartDisease)) +
+    geom_density(alpha = .7) +
+    facet_wrap(~name, scales = "free") +
+    labs(title = "Density plot for categorical variables")
+```
+From this plot we can see that the variables like 
+
+    - Age
+    - MaxHR
+    - Oldpeak
+may be some good predictor canditate.
+
+## Correlation among the numeric predictor
+```{r}
+df %>% 
+    select(is.numeric, -HeartDisease) %>% 
+    ggcorrplot::cor_pmat() %>% 
+    ggcorrplot::ggcorrplot(hc.order = T, lab = T, p.mat = )
+```
+There is not much correlation exists among the predictor variables.
+
+# Modeling
+
+## Defining the models
+```{r}
+models <- list()
+models$lr_specs <-
+    logistic_reg(mode = "classification") %>%
+    set_engine("glm")
+
+models$spline_specs <-
+    mars(
+        mode = "classification",
+        num_terms = tune(),
+        prod_degree = tune(),
+        prune_method = tune()
+    ) %>%
+    set_engine("earth")
+
+models$rf_specs <-
+    rand_forest(
+        mode = "classification",
+        trees = 1000,
+        min_n = tune()
+    ) %>%
+    set_engine("randomForest")
+
+models$bt_specs <-
+    boost_tree(
+        mode = "classification",
+        trees = 1000,
+        min_n = tune(),
+        tree_depth = tune(),
+        learn_rate = tune()
+    ) %>%
+    set_engine("xgboost")
+
+models$svm_specs <-
+    svm_rbf(
+        mode = "classification",
+        cost = tune(),
+        rbf_sigma = tune(),
+        margin = tune()
+    ) %>%
+    set_engine("kernlab")
+```
+
+## Cross validation and recipe
+```{r}
+df_recipe <- 
+    df %>% 
+    recipe(HeartDisease ~ .) %>% 
+    step_string2factor(all_nominal()) %>% 
+    step_mutate(HeartDisease = factor(HeartDisease, 0:1, c("No", "Yes"))) %>% 
+    step_normalize(all_numeric(), - all_outcomes()) %>% 
+    prep() 
+
+set.seed(123)
+df_cv <-
+    df_recipe %>% 
+    juice() %>% 
+    vfold_cv(6)
+```
+
+## Function for model fitting
+```{r}
+model_fit <-
+  function(x) {
+    set.seed(123)
+    
+    if (nrow(parameters(x)) != 0) {
+      vlu_fw <-
+        workflow() %>%
+        add_model(x) %>%
+        add_formula(formula(df_recipe))
+      
+      
+      print("hyperParameter Training")
+      x <-
+        vlu_fw %>%
+        tune_grid(
+          resamples = df_cv,
+          grid = grid_latin_hypercube(parameters(x), size = 25),
+          metrics = metric_set(roc_auc)
+        )
+      print("Model Training")
+      x <-
+        vlu_fw %>%
+        finalize_workflow(select_best(x)) %>%
+        fit(juice(df_recipe))
+    } else {
+      print("Model Training")
+      x <-
+        workflow() %>%
+        add_model(x) %>%
+        add_formula(formula(df_recipe)) %>%
+        fit(juice(df_recipe))
+    }
+    
+    return(x)
+  }
+```
+
+## Model fitting
+```{r}
+# fit_models <- list()
+# for (i in 1:length(models)) {
+#     fit_models[[i]] <- model_fit(models[[i]])
+# } 
+
+fit_models <- readRDS("fitted.Rds")
+```
+
+## Predicting the test dataset
+```{r}
+x <- 
+tibble(model = names(models), fit_models) %>%
+    mutate(
+        tibble = map(fit_models, 
+                     ~ predict(.x, bake( df_recipe, testing(df_split) ), type = "prob")),
+        test = list(
+            testing(df_split) %>% 
+                bake(object = df_recipe) %>% 
+                pull(HeartDisease)
+                        )
+        ) %>% 
+    select(-fit_models) %>% 
+    unnest()
+```
+
+
+## Roc AUC curve
+```{r}
+x %>% 
+    group_by(model) %>%
+    roc_curve(test, .pred_No) %>%
+    autoplot()
+```
+From thsi graph it is not clear that which model is performing better. SO we will find the value of area under the curve.
+
+## Area under curve
+```{r}
+x %>% 
+    group_by(model) %>%
+    roc_auc(test, .pred_No) %>% 
+    arrange(-.estimate) %>% 
+    pander()
+```
+So the models svm, logistic regression and random forest provide almost equal performance. So we will choose any of those 3 as our final model. 
+
+## Accuracy
+```{r}
+x %>% 
+    group_by(model) %>% 
+    mutate(.pred_Yes = ifelse(.pred_Yes > .5, "Yes", "No"),
+           .pred_Yes = factor(.pred_Yes,c("No", "Yes"))) %>% 
+    accuracy(test, .pred_Yes) %>% 
+    arrange(-.estimate) %>% 
+    pander()
+```
+From here we can choose Ranndomforest for our desiarab;e model since it has the highest accuracy.
+
+
+## Variable importance
+```{r}
+fit_models[[3]] %>% 
+    pull_workflow_fit() %>% 
+    vip::vip()
+```
+
+According to this variance importance graph, varaibles "ST_Slope", "ChestPainType" and "Oldpeak" are the most 3 important variables.
+
+## Confusion matrix of the test set
+```{r}
+x %>% 
+    filter(model == "rf_specs") %>% 
+    mutate(.pred_Yes = ifelse(.pred_Yes > .5, "Yes", "No"),
+           .pred_Yes = factor(.pred_Yes,c("No", "Yes"))) %>% 
+    select(Pred = .pred_Yes, true = test)  %>% 
+    table() 
+```
+
+
+
+
+
+
